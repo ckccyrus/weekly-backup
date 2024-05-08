@@ -1,0 +1,181 @@
+def agentNameMap = [:]
+
+pipeline{
+    options {
+        disableConcurrentBuilds() // Prevent this jenkins project run in parallel
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20')) //Remove old builds
+    }
+    parameters {
+        string(
+            name: 'backup_agent',
+            defaultValue: '',
+            description: 'Required param for choosing which agent u want to backup'
+        )
+    }
+    agent {
+        label "$env.backup_agent"
+    }
+    tools {
+        nodejs 'nodejs' // NodeJs configured in Jenkins -> Global Tools Configuration -> NodeJS section
+    }
+    environment {
+        BACKUP_VOLUME_PATH = '/Volumes/BackupVolume'
+    }
+    stages {
+        stage('Checkout'){
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start checking out ...'
+
+                    if (params.backup_agent == '') {
+                        currentBuild.result = 'FAILURE'
+                        error('backup_agent not set')
+                    }
+
+                    echo 'Finish checking out ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Map:AgentName') {
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start mapping ...'
+                    
+                    switch (params.backup_agent) {
+                        case 'agent-frontend':
+                            agentNameMap.put(params.backup_agent, 'MM009')
+                            break
+                        case 'agent-internal-build':
+                            agentNameMap.put(params.backup_agent, 'MM014')
+                            break
+                        case 'agent-prod':
+                            agentNameMap.put(params.backup_agent, 'MM016')
+                            break
+                        default:
+                            echo 'Invalid backup_agent value'
+                            break
+                    }
+
+                    echo "${agentNameMap}"
+                    echo "${agentNameMap[params.backup_agent]}"
+
+
+                    echo 'Finish mapping ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Set:Env'){
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start setting Env ...'
+
+                    Date curDate = new Date();
+                    String curMonth = curDate.format('MM');
+                    String curYear = curDate.format('YYYY');
+                    String curDay = curDate.format('dd');
+
+                    env.CUR_MONTH = curMonth;
+                    env.CUR_YEAR = curYear;
+                    env.CUR_DAY = curDay;
+
+                    env.CURDATE_DIR = env.CUR_YEAR + '-' + env.CUR_MONTH + '-' + env.CUR_DAY;
+
+                    echo '=============Environment Variables=============='
+                    sh 'printenv'
+                    echo '=============/Environment Variables=============='
+
+                    echo 'Finish setting Env ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Run:WeeklyBackup'){
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start running weekly backup ...'
+
+                    dir("$env.GIT_FOLDER_PATH"){
+                        sh "pwd"
+                        sh "ls"
+                        sh "npm install"
+
+                        sh ('node index.js -- -- BACKUP_VOLUME_PATH $BACKUP_VOLUME_PATH -- CURDATE $CURDATE_DIR')
+                    }
+
+                    echo 'Finish running weekly backup ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Publish:ZipToBackupServer'){
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start publishing zip to backup server (MM008) ...'
+
+                    sshPublisher(
+                        publishers: [
+                            sshPublisherDesc(
+                                configName: 'WeeklyBackupVolume', // Configured in jenkins Configure System -> Publish over SSH
+                                transfers: [
+                                    sshTransfer(
+                                        cleanRemote: false, 
+                                        excludes: '**/.result', 
+                                        execCommand: '', 
+                                        execTimeout: 120000,
+                                        flatten: false, 
+                                        makeEmptyDirs: false, 
+                                        noDefaultExcludes: false, 
+                                        patternSeparator: '[, ]+', 
+                                        remoteDirectory: "/${agentNameMap[params.backup_agent]}/", 
+                                        remoteDirectorySDF: false, 
+                                        removePrefix: "$env.GIT_FOLDER_PATH/workspace/",
+                                        sourceFiles: "$env.GIT_FOLDER_PATH/workspace/**/*"
+                                    )
+                                ],
+                                usePromotionTimestamp: false,
+                                useWorkspaceInPromotion: false,
+                                verbose: false
+                            )
+                        ]
+                    )
+
+                    echo 'Finish publishing zip to backup server (MM008) ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Clean:BackupVolume') {
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start cleaning backup volume ...'
+        
+                    def zippedFolderList = []
+
+                    dir ("$env.GIT_FOLDER_PATH/workspace"){
+                        zippedFolderList = readJSON text: sh(
+                            script: "cat .result",
+                            returnStdout: true
+                        )
+                    }
+                         
+                    zippedFolderList.eachWithIndex { eachFolder ->
+                        println(eachFolder)
+
+                        sh "rm -rf $BACKUP_VOLUME_PATH/${eachFolder}"
+                    }
+
+                    echo 'Finish cleaning backup volume ...'
+                    echo '==========================='
+                }
+            }
+        }
+    }
+}

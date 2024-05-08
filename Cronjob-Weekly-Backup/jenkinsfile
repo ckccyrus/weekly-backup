@@ -1,0 +1,208 @@
+import java.time.LocalDate
+import java.time.DayOfWeek
+import java.time.ZoneId
+
+def serverList = ["MM009", "MM014", "MM016"]
+
+pipeline{
+    options {
+        disableConcurrentBuilds() // Prevent this jenkins project run in parallel
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20')) //Remove old builds
+    }
+    agent {
+        label 'agent-backup-routine'
+    }
+    parameters{
+        string(
+            name: 'chat_id',
+			defaultValue: '-979622564',
+			description: "TG chat id \n(-979622564) - to Frontend Reminder"
+        )
+        string(
+            name: 'chat_id_upToDate',
+            defaultValue: '-908968026',
+            description: "TG chat id \n(-908968026) - to Frontend Reminder Check"
+        )
+        string(
+            name: 'cmsHost',
+            defaultValue: '192.168.1.209:9001',
+            description: 'cms server host'
+        )
+    }
+    tools {
+        nodejs 'nodejs' // NodeJs configured in Jenkins -> Global Tools Configuration -> NodeJS section
+    }
+    environment {
+        AGENT_FRONTEND = 'agent-frontend'
+        AGENT_INTERNAL_BUILD = 'agent-internal-build'
+        AGENT_PROD = 'agent-prod'
+        DOCKER_VOLUME_PATH = '/Volumes/DockerVolume/'
+    }
+    stages {
+        stage('setDate'){
+            steps{
+                script{
+                    ZoneId timeZone = ZoneId.of("Asia/Hong_Kong")
+                    LocalDate currentDate = LocalDate.now(timeZone)
+                    int dayOfWeekNumber = currentDate.getDayOfWeek().getValue()
+                    println("Day of the week number: ${dayOfWeekNumber}")
+                    
+                    if (dayOfWeekNumber == 7) {
+                        env.isSunday = true
+                    } else {
+                        env.isSunday = false
+                    }
+                    echo "env.isSunday: $env.isSunday"
+                }
+            }
+        }
+        stage('setCurrentDateDir'){
+            when {
+                expression {
+                    return env.isSunday == 'true';
+                }
+            }
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start setting Env ...'
+
+                    Date curDate = new Date();
+                    String curMonth = curDate.format('MM');
+                    String curYear = curDate.format('YYYY');
+                    String curDay = curDate.format('dd');
+
+                    env.CUR_MONTH = curMonth;
+                    env.CUR_YEAR = curYear;
+                    env.CUR_DAY = curDay;
+
+                    env.CURDATE_DIR = env.CUR_YEAR + '-' + env.CUR_MONTH + '-' + env.CUR_DAY;
+                }
+            }
+        }
+        stage('Run:Backup@frontendServer'){
+            when {
+                expression {
+                    return env.isSunday == 'true';
+                }
+            }
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start running weekly backup on MM009 ...'
+
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        build job: "Backup-Weekly", wait: true, 
+                        parameters: [
+                            string(name: 'backup_agent', value: env.AGENT_FRONTEND)
+                        ]
+                    }
+
+                    echo 'Finish running weekly backup on MM009 ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Run:Backup@InternalServer'){
+            when {
+                expression {
+                    return env.isSunday == 'true';
+                }
+            }
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start running weekly backup on MM014 ...'
+
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        build job: "Backup-Weekly", wait: true, 
+                        parameters: [
+                            string(name: 'backup_agent', value: env.AGENT_INTERNAL_BUILD)
+                        ]
+                    }
+
+                    echo 'Finish running weekly backup on MM014 ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Run:Backup@ProdServer'){
+            when {
+                expression {
+                    return env.isSunday == 'true';
+                }
+            }
+            steps {
+                script {
+                    echo '==========================='
+                    echo 'Start running weekly backup on MM016 ...'
+
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        build job: "Backup-Weekly", wait: true, 
+                        parameters: [
+                            string(name: 'backup_agent', value: env.AGENT_PROD)
+                        ]
+                    }
+
+                    echo 'Finish running weekly backup on MM016 ...'
+                    echo '==========================='
+                }
+            }
+        }
+        stage('Check Folder Existence') {
+            steps {
+                script {
+                    echo "==============Check Folder Existence=============="
+                    env.isMovedToServer = true
+
+                    serverList.each{server ->
+                        println("*************Checking ${server}*************")
+                        
+                        def directoryPath = "/Volumes/WeeklyBackupVolume/${server}"
+                        def folderExists = sh(returnStdout: true, script: "find ${directoryPath} -type d -mindepth 1")
+                        
+                        echo "folderExists: $folderExists"
+                        
+                        if (folderExists) {
+                            echo "A folder exist in ${directoryPath}"
+                            env.isMovedToServer = false
+                        } else {
+                            echo "No folder exist in ${directoryPath}"
+                        }
+                    }
+                    echo "env.isMovedToServer: $env.isMovedToServer"
+
+                    echo "==============/Check Folder Existence=============="
+                }
+            }
+        }
+        stage('Send Backup Reminder') {
+            steps {
+                script {
+                    echo "==============Send Backup Reminder=============="
+
+                    String url = "curl -s $cmsHost/api/SendMessage"
+                    def message = "==========Weekly backup==========\n"
+                    def _chat_id
+
+                    if(env.isMovedToServer == "false") {
+                        message += "Backup folder is found in 208. Please backup it to harddisk."
+                        _chat_id = params.chat_id
+                    } else {
+                        message += "Weekly Backup has moved to harddisk."
+                        _chat_id = params.chat_id_upToDate
+                    }
+
+                    sh """
+                        curl \
+                                --data-urlencode \"chat_id=${_chat_id}\" \
+                                --data-urlencode \"message=${message}\" \
+                            $url;
+                    """
+
+                    echo "==============/Send Backup Reminder=============="
+                }
+            }
+        }
+    }
+}
